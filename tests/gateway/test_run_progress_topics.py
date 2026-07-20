@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -63,6 +64,7 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
     """Adapter with a tiny platform limit to exercise progress rollover."""
 
     MAX_MESSAGE_LENGTH = 180
+    REQUIRES_EDIT_FINALIZE = True
 
     def __init__(self, platform=Platform.TELEGRAM):
         super().__init__(platform=platform)
@@ -77,17 +79,21 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
         if len(content) > self.MAX_MESSAGE_LENGTH:
             self.oversized_sends.append(content)
+        message_id = self._mint_id()
         self.sent.append(
             {
                 "chat_id": chat_id,
+                "message_id": message_id,
                 "content": content,
                 "reply_to": reply_to,
                 "metadata": metadata,
             }
         )
-        return SendResult(success=True, message_id=self._mint_id())
+        return SendResult(success=True, message_id=message_id)
 
-    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
         if len(content) > self.MAX_MESSAGE_LENGTH:
             self.oversized_edits.append(content)
         self.edits.append(
@@ -95,9 +101,32 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "content": content,
+                "finalize": finalize,
+                "metadata": metadata,
             }
         )
         return SendResult(success=True, message_id=message_id)
+
+
+class MissingIdContinuationProgressAdapter(SmallLimitProgressAdapter):
+    """Deliver the first continuation without an editable message ID."""
+
+    def __init__(self, platform=Platform.RELAY):
+        super().__init__(platform=platform)
+        self._send_attempts = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        self._send_attempts += 1
+        if self._send_attempts == 2:
+            self.sent[-1]["message_id"] = None
+            return SendResult(success=True, message_id=None)
+        return result
 
 
 class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
@@ -109,10 +138,57 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "content": content,
+                "finalize": finalize,
                 "metadata": metadata,
             }
         )
         return SendResult(success=True, message_id=message_id)
+
+
+class LifecycleProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    """Relay-like adapter whose edited messages require explicit closure."""
+
+    REQUIRES_EDIT_FINALIZE = True
+    progress_sent = threading.Event()
+    live_edit_seen = threading.Event()
+    commentary_sent = threading.Event()
+    segment_closed = threading.Event()
+
+    def __init__(self, platform=Platform.RELAY):
+        super().__init__(platform=platform)
+        type(self).progress_sent.clear()
+        type(self).live_edit_seen.clear()
+        type(self).commentary_sent.clear()
+        type(self).segment_closed.clear()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        result = await super().send(
+            chat_id,
+            content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if "first-stage" in content or "segment-first" in content:
+            type(self).progress_sent.set()
+        if content == "Checkpoint reached.":
+            type(self).commentary_sent.set()
+        return result
+
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        result = await super().edit_message(
+            chat_id,
+            message_id,
+            content,
+            finalize=finalize,
+            metadata=metadata,
+        )
+        if "third-stage" in content:
+            type(self).live_edit_seen.set()
+        if "segment-first" in content and finalize:
+            type(self).segment_closed.set()
+        return result
 
 
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
@@ -138,6 +214,54 @@ class FakeAgent:
             time.sleep(0.35)
             cb("tool.started", "browser_navigate", "https://example.com", {})
             time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class LiveThenFinalProgressAgent:
+    """Emit a live progress edit, then finish so the bubble must close."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "terminal", "first-stage", {})
+        assert LifecycleProgressCaptureAdapter.progress_sent.wait(timeout=2.0)
+        cb("tool.started", "terminal", "second-stage", {})
+        # Expire the edit throttle, then enqueue a fresh event that drives an
+        # ordinary in-flight edit before the turn completes.
+        time.sleep(2.0)
+        cb("tool.started", "terminal", "third-stage", {})
+        assert LifecycleProgressCaptureAdapter.live_edit_seen.wait(timeout=2.0)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class SegmentedProgressAgent:
+    """Place commentary after progress so the first bubble must close."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.tool_progress_callback is not None
+        assert self.interim_assistant_callback is not None
+        self.tool_progress_callback("tool.started", "terminal", "segment-first", {})
+        assert LifecycleProgressCaptureAdapter.progress_sent.wait(timeout=2.0)
+        self.interim_assistant_callback("Checkpoint reached.", already_streamed=False)
+        assert LifecycleProgressCaptureAdapter.commentary_sent.wait(timeout=2.0)
+        assert LifecycleProgressCaptureAdapter.segment_closed.wait(timeout=2.0)
         return {
             "final_response": "done",
             "messages": [],
@@ -353,6 +477,73 @@ async def test_run_agent_progress_edits_keep_originating_topic_metadata(monkeypa
     assert result["final_response"] == "done"
     assert adapter.edits
     assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.edits)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_progress_finalizes_only_when_closed(monkeypatch, tmp_path):
+    """Relay progress edits stay live until turn completion closes the bubble."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = LiveThenFinalProgressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = LifecycleProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="relay-chat",
+        chat_type="group",
+        delivered_via_upstream_relay=True,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-relay-progress-lifecycle",
+        session_key="agent:main:discord:group:relay-chat",
+    )
+
+    assert result["final_response"] == "done"
+    finalize_flags = [call["finalize"] for call in adapter.edits]
+    assert finalize_flags[:-1]
+    assert all(flag is False for flag in finalize_flags[:-1])
+    assert finalize_flags[-1] is True
+
+
+@pytest.mark.asyncio
+async def test_run_agent_progress_finalizes_at_content_segment_boundary(monkeypatch, tmp_path):
+    """A commentary bubble closes the Relay progress bubble immediately above it."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SegmentedProgressAgent,
+        session_id="sess-relay-progress-segment-lifecycle",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": True,
+            }
+        },
+        adapter_cls=LifecycleProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert LifecycleProgressCaptureAdapter.segment_closed.is_set()
+    segment_edits = [
+        call for call in adapter.edits if "segment-first" in call["content"]
+    ]
+    assert segment_edits
+    assert segment_edits[-1]["finalize"] is True
 
 
 @pytest.mark.asyncio
@@ -826,6 +1017,50 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
     assert adapter.oversized_edits == []
     all_bubbles = [call["content"] for call in adapter.sent + adapter.edits]
     assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in all_bubbles)
+    terminal_edits = [call for call in adapter.edits if call["finalize"] is True]
+    for sent in adapter.sent:
+        assert sum(
+            call["message_id"] == sent["message_id"] for call in terminal_edits
+        ) == 1
+
+
+@pytest.mark.asyncio
+async def test_progress_rollover_missing_id_does_not_reuse_finalized_bubble(
+    monkeypatch, tmp_path
+):
+    """A delivered continuation without an ID falls back without stale edits."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ManyProgressLinesAgent,
+        session_id="sess-progress-overflow-missing-id",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "interim_assistant_messages": False,
+                "tool_preview_length": 60,
+            }
+        },
+        adapter_cls=MissingIdContinuationProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    delivered = "\n".join(
+        call["content"] for call in adapter.sent + adapter.edits
+    )
+    assert "first-short" in delivered
+    for idx in range(1, 8):
+        assert f"overflow-line-{idx}" in delivered
+
+    # The missing-ID continuation cannot be edited. Every other identifiable
+    # one-shot bubble is closed once, without reusing the first bubble's ID.
+    terminal_edits = [call for call in adapter.edits if call["finalize"] is True]
+    for sent in adapter.sent:
+        if sent["message_id"] is None:
+            continue
+        assert sum(
+            call["message_id"] == sent["message_id"] for call in terminal_edits
+        ) == 1
 
 
 @pytest.mark.asyncio
@@ -1224,7 +1459,7 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
     import tools.terminal_tool  # noqa: F401 - register terminal tool metadata
 
-    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    adapter = LifecycleProgressCaptureAdapter()
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -1235,6 +1470,7 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
         chat_id="dm-1",
         chat_type="dm",
         thread_id=None,
+        delivered_via_upstream_relay=True,
     )
     session_key = "agent:main:discord:dm:dm-1"
     runner._session_run_generation[session_key] = 1
@@ -1266,6 +1502,9 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     assert result["final_response"] == "done"
     assert 'first command' in all_progress_text
     assert 'second command' not in all_progress_text
+    assert adapter.edits
+    assert adapter.edits[-1]["finalize"] is True
+    assert 'first command' in adapter.edits[-1]["content"]
 
 
 @pytest.mark.asyncio
